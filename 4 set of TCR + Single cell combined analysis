@@ -1,0 +1,1110 @@
+# Integrated TCR and gene-expression analysis for Pool185 samples 81-84
+#
+# GEX/TCR sample pairs:
+#   Pool185_77 GEX -> Pool185_81 TCR
+#   Pool185_78 GEX -> Pool185_82 TCR
+#   Pool185_79 GEX -> Pool185_83 TCR
+#   Pool185_80 GEX -> Pool185_84 TCR
+
+library(Seurat)
+library(tidyverse)
+library(janitor)
+library(vegan)
+library(scales)
+
+set.seed(185)
+
+# ---- User configuration ----
+# Update these three paths before running the script.
+#
+# Expected input layout:
+#   gex_root/Pool185_77_outs
+#   gex_root/Pool185_78_outs
+#   gex_root/Pool185_79_outs
+#   gex_root/Pool185_80_outs
+#
+#   tcr_root/Pool185_81_outs
+#   tcr_root/Pool185_82_outs
+#   tcr_root/Pool185_83_outs
+#   tcr_root/Pool185_84_outs
+#
+# All generated files will be written under output_root.
+
+gex_root <- "path/to/GEX_outputs"
+tcr_root <- "path/to/TCR_outputs"
+output_root <- "path/to/analysis_outputs"
+
+configured_paths <- c(gex_root, tcr_root, output_root)
+if (any(startsWith(configured_paths, "path/to/"))) {
+  stop(
+    "Update gex_root, tcr_root, and output_root in the user configuration section before running the script."
+  )
+}
+
+# ---- Sample information ----
+
+sample_map <- tibble(
+  set_id = c("Set1", "Set2", "Set3", "Set4"),
+  gex_sample = c("Pool185_77", "Pool185_78", "Pool185_79", "Pool185_80"),
+  tcr_sample = c("Pool185_81", "Pool185_82", "Pool185_83", "Pool185_84"),
+  gex_dir = file.path(gex_root, paste0(gex_sample, "_outs")),
+  tcr_dir = file.path(tcr_root, paste0(tcr_sample, "_outs")),
+  analysis_dir = file.path(
+    output_root,
+    paste0(tcr_sample, "_MASTER_TCR_GEX_analysis")
+  )
+)
+
+missing_input_dirs <- c(sample_map$gex_dir, sample_map$tcr_dir)
+missing_input_dirs <- missing_input_dirs[!dir.exists(missing_input_dirs)]
+
+if (length(missing_input_dirs) > 0) {
+  stop(
+    "The following input directories could not be found:\n",
+    paste0("  - ", missing_input_dirs, collapse = "\n"),
+    "\nCheck the user configuration paths and sample folder names."
+  )
+}
+
+comparison_dir <- file.path(
+  output_root,
+  "Pool185_81_to_84_MASTER_COMPARISON"
+)
+
+dir.create(output_root, showWarnings = FALSE, recursive = TRUE)
+dir.create(comparison_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ---- Preliminary cluster annotations ----
+# Labels were assigned from the top marker genes reviewed for each set.
+
+celltype_labels <- list(
+  
+  Set1 = c(
+    "0"  = "Effector Treg-like",
+    "1"  = "CD4 helper/memory-like T",
+    "2"  = "CD8 cytotoxic T",
+    "3"  = "Activated T",
+    "4"  = "Gamma-delta T",
+    "5"  = "Unclear/non-immune-like",
+    "6"  = "TOX+ activated/exhaustion-like T",
+    "7"  = "Cytotoxic effector T",
+    "8"  = "Cycling/proliferating cells",
+    "9"  = "Macrophage/myeloid-like",
+    "10" = "Gamma-delta T17-like",
+    "11" = "Cycling/S-phase cells",
+    "12" = "NK/ILC-like",
+    "13" = "Neutrophil/granulocyte",
+    "14" = "Endothelial",
+    "15" = "Pericyte/mural-like",
+    "16" = "Activated APC/myeloid-like",
+    "17" = "Fibroblast/stromal"
+  ),
+  
+  Set2 = c(
+    "0"  = "Effector Treg-like",
+    "1"  = "Activated T",
+    "2"  = "CD8 cytotoxic T",
+    "3"  = "CD4 helper/memory-like T",
+    "4"  = "Gamma-delta T",
+    "5"  = "TOX+/IKZF2 activated T-like",
+    "6"  = "Unclear T-like/activated",
+    "7"  = "Interferon-stimulated cells",
+    "8"  = "Cycling/proliferating cells",
+    "9"  = "Gamma-delta T17-like",
+    "10" = "Cycling/S-phase cells",
+    "11" = "NK/ILC-like",
+    "12" = "CD8 effector T",
+    "13" = "Neutrophil/granulocyte",
+    "14" = "Cytotoxic NK/T-like",
+    "15" = "Vascular mural/pericyte-like",
+    "16" = "Macrophage/myeloid-like"
+  ),
+  
+  Set3 = c(
+    "0"  = "Effector Treg-like",
+    "1"  = "CD8 cytotoxic T",
+    "2"  = "Gamma-delta T",
+    "3"  = "Activated T",
+    "4"  = "CD4 helper/memory-like T",
+    "5"  = "NK/ILC-like",
+    "6"  = "Cycling/proliferating cells",
+    "7"  = "Unclear/neural-like contaminant",
+    "8"  = "Type 2 helper/ILC2-like",
+    "9"  = "Gamma-delta T17-like",
+    "10" = "Stromal/epithelial-like",
+    "11" = "Cycling/S-phase cells",
+    "12" = "Endothelial/vascular mural-like",
+    "13" = "Rare/unassigned",
+    "14" = "Fibroblast/stromal",
+    "15" = "Macrophage/myeloid-like"
+  ),
+  
+  Set4 = c(
+    "0"  = "CD8 cytotoxic T",
+    "1"  = "Activated CD4/T-like",
+    "2"  = "Effector Treg-like",
+    "3"  = "Gamma-delta T",
+    "4"  = "Unclear neural/stromal-like",
+    "5"  = "CD4 helper/memory-like T",
+    "6"  = "GZMK+ CD8/effector-memory T",
+    "7"  = "Cycling/proliferating cells",
+    "8"  = "Activated/effector Treg-like",
+    "9"  = "Interferon-stimulated cells",
+    "10" = "NK/ILC-like",
+    "11" = "Type 2 helper/ILC2-like",
+    "12" = "Rare/unassigned neural-like",
+    "13" = "Gamma-delta T17-like",
+    "14" = "TOX+/IKZF2 activated T-like",
+    "15" = "Fibroblast/stromal",
+    "16" = "Immediate early/activated T-like",
+    "17" = "Macrophage/myeloid-like"
+  )
+)
+
+# ---- Utility functions ----
+
+extract_10x_barcode <- function(x) {
+  stringr::str_extract(x, "[ACGT]{16}-[0-9]+")
+}
+
+find_one_file <- function(folder, pattern, label) {
+  hits <- list.files(
+    folder,
+    pattern = pattern,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  
+  if (length(hits) == 0) {
+    stop("Could not find ", label, " in: ", folder)
+  }
+  
+  hits[1]
+}
+
+read_gex_counts <- function(gex_dir) {
+  h5_file <- file.path(gex_dir, "filtered_feature_bc_matrix.h5")
+  matrix_dir <- file.path(gex_dir, "filtered_feature_bc_matrix")
+  
+  if (file.exists(h5_file)) {
+    gex_counts <- Read10X_h5(h5_file)
+  } else if (dir.exists(matrix_dir)) {
+    gex_counts <- Read10X(matrix_dir)
+  } else {
+    stop("Could not find filtered_feature_bc_matrix.h5 or filtered_feature_bc_matrix in: ", gex_dir)
+  }
+  
+  if (is.list(gex_counts)) {
+    if ("Gene Expression" %in% names(gex_counts)) {
+      gex_counts <- gex_counts[["Gene Expression"]]
+    } else {
+      gex_counts <- gex_counts[[1]]
+    }
+  }
+  
+  return(gex_counts)
+}
+
+save_plot <- function(plot_obj, filename, width = 8, height = 6) {
+  ggsave(filename, plot_obj, width = width, height = height, dpi = 300)
+}
+
+# ---- Analyze one paired GEX/TCR set ----
+
+run_one_set <- function(set_row, cluster_label_vector) {
+  
+  set_id <- set_row$set_id
+  gex_sample <- set_row$gex_sample
+  tcr_sample <- set_row$tcr_sample
+  gex_dir <- set_row$gex_dir
+  tcr_dir <- set_row$tcr_dir
+  outdir <- set_row$analysis_dir
+  
+  message("====================================================")
+  message("Running ", set_id, ": ", gex_sample, " GEX -> ", tcr_sample, " TCR")
+  message("====================================================")
+  
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Load the TCR output files
+  
+  metrics_file <- list.files(
+    tcr_dir,
+    pattern = "^metrics_summary.*\\.csv$",
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  
+  clonotypes_file <- find_one_file(
+    tcr_dir,
+    "^clonotypes.*\\.csv$",
+    "clonotypes.csv"
+  )
+  
+  contig_file <- find_one_file(
+    tcr_dir,
+    "^filtered_contig_annotations.*\\.csv$",
+    "filtered_contig_annotations.csv"
+  )
+  
+  if (length(metrics_file) > 0) {
+    metrics <- read_csv(metrics_file[1], show_col_types = FALSE)
+    write_csv(metrics, file.path(outdir, "01_metrics_summary_copy.csv"))
+  }
+  
+  clonos <- read_csv(clonotypes_file, show_col_types = FALSE) %>%
+    clean_names()
+  
+  contig <- read_csv(contig_file, show_col_types = FALSE) %>%
+    clean_names()
+  
+  # Summarize clonotype abundance and diversity
+  
+  clonos2 <- clonos %>%
+    mutate(
+      frequency = as.numeric(frequency)
+    ) %>%
+    arrange(desc(frequency)) %>%
+    mutate(
+      clonotype_rank = row_number(),
+      percent = if ("proportion" %in% names(.)) {
+        as.numeric(proportion) * 100
+      } else {
+        frequency / sum(frequency, na.rm = TRUE) * 100
+      },
+      frequency_bin = case_when(
+        percent >= 1 ~ "Dominant >=1%",
+        percent >= 0.2 ~ "Expanded 0.2-1%",
+        percent >= 0.1 ~ "Low-frequency 0.1-0.2%",
+        TRUE ~ "Rare tail <0.1%"
+      )
+    )
+  
+  write_csv(clonos2, file.path(outdir, "02_all_clonotypes_ranked_with_bins.csv"))
+  
+  diversity_summary <- tibble(
+    set_id = set_id,
+    gex_sample = gex_sample,
+    tcr_sample = tcr_sample,
+    total_clonotypes = nrow(clonos2),
+    total_tcr_barcodes = sum(clonos2$frequency, na.rm = TRUE),
+    top_1_percent = sum(clonos2$percent[1:min(1, nrow(clonos2))], na.rm = TRUE),
+    top_5_percent = sum(clonos2$percent[1:min(5, nrow(clonos2))], na.rm = TRUE),
+    top_10_percent = sum(clonos2$percent[1:min(10, nrow(clonos2))], na.rm = TRUE),
+    top_20_percent = sum(clonos2$percent[1:min(20, nrow(clonos2))], na.rm = TRUE),
+    top_50_percent = sum(clonos2$percent[1:min(50, nrow(clonos2))], na.rm = TRUE),
+    shannon_diversity = diversity(clonos2$frequency, index = "shannon"),
+    simpson_diversity = diversity(clonos2$frequency, index = "simpson")
+  )
+  
+  write_csv(diversity_summary, file.path(outdir, "03_tcr_diversity_summary.csv"))
+  
+  bin_summary <- clonos2 %>%
+    group_by(frequency_bin) %>%
+    summarise(
+      clonotype_count = n(),
+      barcode_count = sum(frequency, na.rm = TRUE),
+      percent_of_tcr_barcodes = sum(percent, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      set_id = set_id,
+      gex_sample = gex_sample,
+      tcr_sample = tcr_sample
+    ) %>%
+    arrange(desc(percent_of_tcr_barcodes))
+  
+  write_csv(bin_summary, file.path(outdir, "04_clonotype_frequency_bin_summary.csv"))
+  
+  p_bin <- bin_summary %>%
+    ggplot(aes(x = frequency_bin, y = percent_of_tcr_barcodes)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste0(tcr_sample, " TCR Clonotype Frequency Bins"),
+      x = "Frequency bin",
+      y = "Percent of TCR barcodes"
+    ) +
+    theme_classic()
+  
+  save_plot(p_bin, file.path(outdir, "04_clonotype_frequency_bin_summary.png"), 8, 5)
+  
+  p_top20 <- clonos2 %>%
+    slice_head(n = 20) %>%
+    ggplot(aes(x = fct_reorder(clonotype_id, percent), y = percent)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste0(tcr_sample, " Top 20 TCR Clonotypes"),
+      x = "Clonotype",
+      y = "Percent of TCR barcodes"
+    ) +
+    theme_classic()
+  
+  save_plot(p_top20, file.path(outdir, "05_top_20_clonotypes.png"), 8, 6)
+  
+  p_cumulative <- clonos2 %>%
+    mutate(cumulative_percent = cumsum(percent)) %>%
+    ggplot(aes(x = clonotype_rank, y = cumulative_percent)) +
+    geom_line() +
+    labs(
+      title = paste0(tcr_sample, " Cumulative Clonotype Contribution"),
+      x = "Clonotype rank",
+      y = "Cumulative percent of TCR barcodes"
+    ) +
+    theme_classic()
+  
+  save_plot(p_cumulative, file.path(outdir, "06_cumulative_clonotype_contribution.png"), 8, 5)
+  
+  # Summarize productive contigs and receptor features
+  
+  contig_prod <- contig %>%
+    filter(as.character(productive) %in% c("TRUE", "True", "true", "T"))
+  
+  write_csv(contig_prod, file.path(outdir, "07_productive_tcr_contigs.csv"))
+  
+  chain_summary <- contig_prod %>%
+    count(chain, sort = TRUE)
+  
+  write_csv(chain_summary, file.path(outdir, "08_productive_chain_summary.csv"))
+  
+  p_chain <- chain_summary %>%
+    ggplot(aes(x = chain, y = n)) +
+    geom_col() +
+    labs(
+      title = paste0(tcr_sample, " Productive TCR Chain Counts"),
+      x = "TCR chain",
+      y = "Productive contig count"
+    ) +
+    theme_classic()
+  
+  save_plot(p_chain, file.path(outdir, "08_productive_chain_counts.png"), 6, 5)
+  
+  paired_summary <- contig_prod %>%
+    filter(chain %in% c("TRA", "TRB")) %>%
+    distinct(barcode, chain) %>%
+    group_by(barcode) %>%
+    summarise(
+      has_TRA = any(chain == "TRA"),
+      has_TRB = any(chain == "TRB"),
+      chain_status = case_when(
+        has_TRA & has_TRB ~ "Paired TRA+TRB",
+        has_TRA & !has_TRB ~ "TRA only",
+        !has_TRA & has_TRB ~ "TRB only",
+        TRUE ~ "Other"
+      ),
+      .groups = "drop"
+    )
+  
+  paired_counts <- paired_summary %>%
+    count(chain_status) %>%
+    mutate(percent = n / sum(n) * 100)
+  
+  write_csv(paired_counts, file.path(outdir, "09_paired_TRA_TRB_summary.csv"))
+  
+  p_paired <- paired_counts %>%
+    ggplot(aes(x = chain_status, y = percent)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste0(tcr_sample, " Paired TRA/TRB Recovery"),
+      x = "TCR recovery status",
+      y = "Percent of TCR-positive cells"
+    ) +
+    theme_classic()
+  
+  save_plot(p_paired, file.path(outdir, "09_paired_TRA_TRB_recovery.png"), 7, 5)
+  
+  v_gene_summary <- contig_prod %>%
+    filter(chain %in% c("TRA", "TRB"), !is.na(v_gene)) %>%
+    count(chain, v_gene, sort = TRUE)
+  
+  write_csv(v_gene_summary, file.path(outdir, "10_v_gene_usage_summary.csv"))
+  
+  p_vgene <- v_gene_summary %>%
+    group_by(chain) %>%
+    slice_max(n, n = 20, with_ties = FALSE) %>%
+    ungroup() %>%
+    ggplot(aes(x = fct_reorder(v_gene, n), y = n)) +
+    geom_col() +
+    coord_flip() +
+    facet_wrap(~chain, scales = "free_y") +
+    labs(
+      title = paste0(tcr_sample, " Top TCR V Gene Usage"),
+      x = "V gene",
+      y = "Productive contig count"
+    ) +
+    theme_classic()
+  
+  save_plot(p_vgene, file.path(outdir, "10_top_v_gene_usage.png"), 10, 6)
+  
+  j_gene_summary <- contig_prod %>%
+    filter(chain %in% c("TRA", "TRB"), !is.na(j_gene)) %>%
+    count(chain, j_gene, sort = TRUE)
+  
+  write_csv(j_gene_summary, file.path(outdir, "11_j_gene_usage_summary.csv"))
+  
+  p_jgene <- j_gene_summary %>%
+    group_by(chain) %>%
+    slice_max(n, n = 20, with_ties = FALSE) %>%
+    ungroup() %>%
+    ggplot(aes(x = fct_reorder(j_gene, n), y = n)) +
+    geom_col() +
+    coord_flip() +
+    facet_wrap(~chain, scales = "free_y") +
+    labs(
+      title = paste0(tcr_sample, " Top TCR J Gene Usage"),
+      x = "J gene",
+      y = "Productive contig count"
+    ) +
+    theme_classic()
+  
+  save_plot(p_jgene, file.path(outdir, "11_top_j_gene_usage.png"), 10, 6)
+  
+  cdr3_lengths <- contig_prod %>%
+    filter(chain %in% c("TRA", "TRB"), !is.na(cdr3)) %>%
+    mutate(cdr3_length = nchar(cdr3))
+  
+  write_csv(cdr3_lengths, file.path(outdir, "12_cdr3_lengths_by_contig.csv"))
+  
+  p_cdr3 <- cdr3_lengths %>%
+    ggplot(aes(x = cdr3_length)) +
+    geom_histogram(binwidth = 1) +
+    facet_wrap(~chain) +
+    labs(
+      title = paste0(tcr_sample, " CDR3 Amino Acid Length Distribution"),
+      x = "CDR3 amino acid length",
+      y = "Productive contig count"
+    ) +
+    theme_classic()
+  
+  save_plot(p_cdr3, file.path(outdir, "12_cdr3_length_distribution.png"), 8, 5)
+  
+  expanded <- clonos2 %>% filter(percent >= 0.2)
+  low_frequency <- clonos2 %>% filter(percent >= 0.1, percent < 0.2)
+  rare_tail <- clonos2 %>% filter(percent < 0.1)
+  
+  write_csv(expanded, file.path(outdir, "13_expanded_clonotypes_percent_ge_0.2.csv"))
+  write_csv(low_frequency, file.path(outdir, "14_low_frequency_clonotypes_0.1_to_0.2.csv"))
+  write_csv(rare_tail, file.path(outdir, "15_rare_tail_clonotypes_lt_0.1.csv"))
+  
+  expanded_contig_details <- contig_prod %>%
+    filter(raw_clonotype_id %in% expanded$clonotype_id) %>%
+    left_join(
+      clonos2 %>%
+        select(clonotype_id, frequency, percent, frequency_bin),
+      by = c("raw_clonotype_id" = "clonotype_id")
+    ) %>%
+    select(any_of(c(
+      "raw_clonotype_id", "frequency", "percent", "frequency_bin",
+      "barcode", "chain", "v_gene", "j_gene", "c_gene",
+      "cdr3", "cdr3_nt", "reads", "umis"
+    ))) %>%
+    arrange(desc(percent), raw_clonotype_id, barcode, chain)
+  
+  write_csv(
+    expanded_contig_details,
+    file.path(outdir, "16_expanded_clonotype_CDR3_VJ_details.csv")
+  )
+  
+  expanded_clonotype_summary <- expanded_contig_details %>%
+    group_by(raw_clonotype_id, frequency, percent, frequency_bin) %>%
+    summarise(
+      chains_detected = paste(sort(unique(chain)), collapse = "; "),
+      v_genes = paste(sort(unique(na.omit(v_gene))), collapse = "; "),
+      j_genes = paste(sort(unique(na.omit(j_gene))), collapse = "; "),
+      cdr3s = paste(sort(unique(na.omit(cdr3))), collapse = "; "),
+      number_of_cells = n_distinct(barcode),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(percent))
+  
+  write_csv(
+    expanded_clonotype_summary,
+    file.path(outdir, "17_expanded_clonotype_summary_collapsed.csv")
+  )
+  
+  # Build and process the matching gene-expression dataset
+  
+  gex_counts <- read_gex_counts(gex_dir)
+  
+  seurat_obj <- CreateSeuratObject(
+    counts = gex_counts,
+    project = gex_sample,
+    min.cells = 3,
+    min.features = 200
+  )
+  
+  mt_pattern <- if (any(grepl("^mt-", rownames(seurat_obj)))) "^mt-" else "^MT-"
+  
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = mt_pattern)
+  
+  p_qc <- VlnPlot(
+    seurat_obj,
+    features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+    ncol = 3
+  ) +
+    ggtitle(paste0(gex_sample, " QC Before Filtering"))
+  
+  save_plot(p_qc, file.path(outdir, "18_QC_violin_before_filtering.png"), 10, 5)
+  
+  seurat_obj <- subset(
+    seurat_obj,
+    subset = nFeature_RNA > 200 &
+      nFeature_RNA < 6000 &
+      percent.mt < 15
+  )
+  
+  seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+  seurat_obj <- FindVariableFeatures(seurat_obj, verbose = FALSE)
+  seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+  seurat_obj <- RunPCA(seurat_obj, verbose = FALSE)
+  
+  p_elbow <- ElbowPlot(seurat_obj) +
+    ggtitle(paste0(gex_sample, " PCA Elbow Plot"))
+  
+  save_plot(p_elbow, file.path(outdir, "19_PCA_elbow_plot.png"), 7, 5)
+  
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:20, verbose = FALSE)
+  seurat_obj <- FindClusters(seurat_obj, resolution = 0.5, random.seed = 185, verbose = FALSE)
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:20, seed.use = 185, verbose = FALSE)
+  
+  p_umap_clusters <- DimPlot(
+    seurat_obj,
+    reduction = "umap",
+    label = TRUE
+  ) +
+    ggtitle(paste0(gex_sample, " Seurat Clusters"))
+  
+  save_plot(p_umap_clusters, file.path(outdir, "20_Seurat_UMAP_clusters.png"), 8, 6)
+  
+  # Review marker expression and identify cluster markers
+  
+  marker_genes <- c(
+    "Cd3d", "Cd3e", "Trac",
+    "Cd4", "Cd8a", "Cd8b1",
+    "Nkg7", "Gzmb", "Gzmk", "Prf1", "Ifng",
+    "Pdcd1", "Lag3", "Havcr2", "Tox",
+    "Il7r", "Ccr7", "Sell", "Tcf7",
+    "Foxp3", "Il2ra", "Ctla4",
+    "Trdc", "Trgc1", "Trgc2", "Trgc4",
+    "Il17a", "Rorc", "Il23r",
+    "Ncr1", "Klrb1c", "Klrb1b", "Klrb1f",
+    "Ms4a1", "Cd79a",
+    "Lyz2", "Csf1r", "C1qa", "C1qb", "C1qc",
+    "S100a8", "S100a9",
+    "Cldn5", "Tie1", "Plvap",
+    "Rgs5", "Acta2",
+    "Col1a1", "Dcn", "Lum",
+    "Ifit1", "Ifit3", "Mx1", "Mx2", "Rsad2"
+  )
+  
+  marker_genes_present <- marker_genes[marker_genes %in% rownames(seurat_obj)]
+  
+  p_dot <- DotPlot(
+    seurat_obj,
+    features = marker_genes_present
+  ) +
+    RotatedAxis() +
+    ggtitle(paste0(gex_sample, " Cluster Marker Gene Expression"))
+  
+  save_plot(p_dot, file.path(outdir, "21_cluster_marker_dotplot.png"), 14, 7)
+  
+  cluster_markers <- FindAllMarkers(
+    seurat_obj,
+    only.pos = TRUE,
+    min.pct = 0.25,
+    logfc.threshold = 0.25
+  )
+  
+  write_csv(cluster_markers, file.path(outdir, "22_FindAllMarkers_by_cluster.csv"))
+  
+  top10_markers <- cluster_markers %>%
+    group_by(cluster) %>%
+    slice_max(avg_log2FC, n = 10) %>%
+    ungroup()
+  
+  write_csv(top10_markers, file.path(outdir, "23_top10_markers_by_cluster.csv"))
+  
+  top_markers_compact <- top10_markers %>%
+    group_by(cluster) %>%
+    summarise(
+      top_genes = paste(gene, collapse = ", "),
+      .groups = "drop"
+    )
+  
+  write_csv(top_markers_compact, file.path(outdir, "24_top_markers_compact.csv"))
+  
+  # Match TCR and GEX barcodes, then add TCR metadata to Seurat
+  
+  tcr_barcodes <- unique(contig_prod$barcode)
+  rna_barcodes <- colnames(seurat_obj)
+  
+  direct_overlap <- sum(tcr_barcodes %in% rna_barcodes)
+  
+  tcr_clean <- tibble(
+    tcr_barcode_original = tcr_barcodes,
+    barcode_core = extract_10x_barcode(tcr_barcodes)
+  )
+  
+  rna_clean <- tibble(
+    seurat_cell = rna_barcodes,
+    barcode_core = extract_10x_barcode(rna_barcodes)
+  )
+  
+  barcode_overlap <- inner_join(rna_clean, tcr_clean, by = "barcode_core")
+  
+  overlap_summary <- tibble(
+    set_id = set_id,
+    gex_sample = gex_sample,
+    tcr_sample = tcr_sample,
+    unique_tcr_barcodes = length(unique(tcr_barcodes)),
+    seurat_cells_after_qc = ncol(seurat_obj),
+    direct_overlap = direct_overlap,
+    cleaned_barcode_overlap = nrow(barcode_overlap),
+    percent_tcr_barcodes_matched = nrow(barcode_overlap) / length(unique(tcr_barcodes)) * 100,
+    percent_seurat_cells_with_tcr = nrow(barcode_overlap) / ncol(seurat_obj) * 100
+  )
+  
+  write_csv(overlap_summary, file.path(outdir, "25_barcode_overlap_summary.csv"))
+  
+  tcr_cell_raw <- contig_prod %>%
+    filter(chain %in% c("TRA", "TRB")) %>%
+    left_join(
+      clonos2 %>%
+        select(clonotype_id, frequency, percent, frequency_bin),
+      by = c("raw_clonotype_id" = "clonotype_id")
+    ) %>%
+    mutate(barcode_core = extract_10x_barcode(barcode))
+  
+  tcr_cell_meta <- tcr_cell_raw %>%
+    group_by(barcode_core) %>%
+    arrange(desc(percent), .by_group = TRUE) %>%
+    summarise(
+      tcr_clonotype_id = first(raw_clonotype_id),
+      all_tcr_clonotype_ids = paste(sort(unique(raw_clonotype_id)), collapse = "; "),
+      tcr_frequency = first(frequency),
+      tcr_percent = first(percent),
+      tcr_frequency_bin = first(frequency_bin),
+      chains_detected = paste(sort(unique(chain)), collapse = "; "),
+      tra_cdr3 = paste(sort(unique(na.omit(cdr3[chain == "TRA"]))), collapse = "; "),
+      trb_cdr3 = paste(sort(unique(na.omit(cdr3[chain == "TRB"]))), collapse = "; "),
+      tra_v_gene = paste(sort(unique(na.omit(v_gene[chain == "TRA"]))), collapse = "; "),
+      trb_v_gene = paste(sort(unique(na.omit(v_gene[chain == "TRB"]))), collapse = "; "),
+      tra_j_gene = paste(sort(unique(na.omit(j_gene[chain == "TRA"]))), collapse = "; "),
+      trb_j_gene = paste(sort(unique(na.omit(j_gene[chain == "TRB"]))), collapse = "; "),
+      .groups = "drop"
+    )
+  
+  write_csv(tcr_cell_meta, file.path(outdir, "26_tcr_cell_level_metadata_for_seurat.csv"))
+  
+  seurat_key <- tibble(
+    seurat_cell = colnames(seurat_obj),
+    barcode_core = extract_10x_barcode(colnames(seurat_obj))
+  )
+  
+  tcr_meta_for_seurat <- seurat_key %>%
+    left_join(tcr_cell_meta, by = "barcode_core") %>%
+    select(-barcode_core)
+  
+  tcr_meta_for_seurat <- as.data.frame(tcr_meta_for_seurat)
+  rownames(tcr_meta_for_seurat) <- tcr_meta_for_seurat$seurat_cell
+  tcr_meta_for_seurat$seurat_cell <- NULL
+  tcr_meta_for_seurat <- tcr_meta_for_seurat[colnames(seurat_obj), , drop = FALSE]
+  
+  if (!identical(rownames(tcr_meta_for_seurat), colnames(seurat_obj))) {
+    stop("TCR metadata rownames do not match Seurat cell names for ", set_id)
+  }
+  
+  seurat_obj <- AddMetaData(
+    object = seurat_obj,
+    metadata = tcr_meta_for_seurat
+  )
+  
+  # Visualize TCR expansion on the UMAP and across clusters
+  
+  p_tcr_umap <- DimPlot(
+    seurat_obj,
+    reduction = "umap",
+    group.by = "tcr_frequency_bin",
+    pt.size = 0.3
+  ) +
+    ggtitle(paste0(tcr_sample, " TCR Clonotype Expansion on ", gex_sample, " UMAP"))
+  
+  save_plot(p_tcr_umap, file.path(outdir, "27_UMAP_TCR_frequency_bin.png"), 8, 6)
+  
+  tcr_by_cluster <- seurat_obj@meta.data %>%
+    rownames_to_column("cell") %>%
+    filter(!is.na(tcr_frequency_bin)) %>%
+    count(seurat_clusters, tcr_frequency_bin) %>%
+    group_by(seurat_clusters) %>%
+    mutate(percent = n / sum(n) * 100) %>%
+    ungroup() %>%
+    mutate(
+      set_id = set_id,
+      gex_sample = gex_sample,
+      tcr_sample = tcr_sample
+    )
+  
+  write_csv(tcr_by_cluster, file.path(outdir, "28_TCR_frequency_bin_by_Seurat_cluster.csv"))
+  
+  p_tcr_cluster <- tcr_by_cluster %>%
+    ggplot(aes(x = seurat_clusters, y = percent, fill = tcr_frequency_bin)) +
+    geom_col() +
+    labs(
+      title = paste0(tcr_sample, " TCR Expansion Categories by ", gex_sample, " Cluster"),
+      x = "Seurat cluster",
+      y = "Percent of TCR-positive cells",
+      fill = "TCR category"
+    ) +
+    theme_classic()
+  
+  save_plot(p_tcr_cluster, file.path(outdir, "28_TCR_frequency_bin_by_cluster.png"), 9, 6)
+  
+  top_clones_by_cluster <- seurat_obj@meta.data %>%
+    rownames_to_column("cell") %>%
+    filter(!is.na(tcr_clonotype_id)) %>%
+    count(seurat_clusters, tcr_clonotype_id, tcr_frequency_bin, sort = TRUE) %>%
+    mutate(
+      set_id = set_id,
+      gex_sample = gex_sample,
+      tcr_sample = tcr_sample
+    )
+  
+  write_csv(top_clones_by_cluster, file.path(outdir, "29_Top_TCR_clonotypes_by_cluster.csv"))
+  
+  # Add the preliminary cell-type annotations
+  
+  celltype_vec <- unname(cluster_label_vector[as.character(seurat_obj$seurat_clusters)])
+  
+  if (length(celltype_vec) != ncol(seurat_obj)) {
+    stop("Cell type label vector length does not match Seurat cells for ", set_id)
+  }
+  
+  seurat_obj$celltype_firstpass <- celltype_vec
+  
+  p_celltypes <- DimPlot(
+    seurat_obj,
+    reduction = "umap",
+    group.by = "celltype_firstpass",
+    label = TRUE,
+    repel = TRUE
+  ) +
+    ggtitle(paste0(set_id, " First-pass Cell Type Annotation"))
+  
+  save_plot(p_celltypes, file.path(outdir, "30_UMAP_firstpass_celltype_annotation.png"), 10, 7)
+  
+  # Summarize TCR expansion by annotated cell type
+  
+  tcr_by_celltype <- seurat_obj@meta.data %>%
+    rownames_to_column("cell") %>%
+    filter(!is.na(tcr_frequency_bin), !is.na(celltype_firstpass)) %>%
+    count(celltype_firstpass, tcr_frequency_bin) %>%
+    group_by(celltype_firstpass) %>%
+    mutate(percent = n / sum(n) * 100) %>%
+    ungroup() %>%
+    mutate(
+      set_id = set_id,
+      gex_sample = gex_sample,
+      tcr_sample = tcr_sample
+    )
+  
+  write_csv(tcr_by_celltype, file.path(outdir, "31_TCR_frequency_bin_by_celltype_firstpass.csv"))
+  
+  p_tcr_celltype <- tcr_by_celltype %>%
+    ggplot(aes(x = celltype_firstpass, y = percent, fill = tcr_frequency_bin)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste0(set_id, " TCR Expansion Categories by Cell Type"),
+      x = "First-pass cell type",
+      y = "Percent of TCR-positive cells",
+      fill = "TCR category"
+    ) +
+    theme_classic()
+  
+  save_plot(p_tcr_celltype, file.path(outdir, "31_TCR_frequency_bin_by_celltype_firstpass.png"), 10, 7)
+  
+  top_clones_by_celltype <- seurat_obj@meta.data %>%
+    rownames_to_column("cell") %>%
+    filter(!is.na(tcr_clonotype_id), !is.na(celltype_firstpass)) %>%
+    count(celltype_firstpass, tcr_clonotype_id, tcr_frequency_bin, sort = TRUE) %>%
+    mutate(
+      set_id = set_id,
+      gex_sample = gex_sample,
+      tcr_sample = tcr_sample
+    )
+  
+  write_csv(top_clones_by_celltype, file.path(outdir, "32_Top_TCR_clonotypes_by_celltype.csv"))
+  
+  # Save the annotated Seurat object
+  
+  final_rds <- file.path(
+    outdir,
+    paste0(set_id, "_", tcr_sample, "_TCR_with_", gex_sample, "_GEX_FINAL.rds")
+  )
+  
+  saveRDS(seurat_obj, final_rds)
+  
+  message("Finished ", set_id, ". Output folder: ", outdir)
+  
+  # Keep only the summary tables needed for the cross-sample analysis
+  result <- list(
+    set_id = set_id,
+    gex_sample = gex_sample,
+    tcr_sample = tcr_sample,
+    outdir = outdir,
+    diversity_summary = diversity_summary,
+    bin_summary = bin_summary,
+    overlap_summary = overlap_summary,
+    tcr_by_cluster = tcr_by_cluster,
+    tcr_by_celltype = tcr_by_celltype,
+    top_clones_by_celltype = top_clones_by_celltype,
+    top_markers_compact = top_markers_compact
+  )
+  
+  rm(seurat_obj, gex_counts)
+  gc()
+  
+  return(result)
+}
+
+# ---- Run all four sample pairs ----
+
+results <- list()
+
+for (i in seq_len(nrow(sample_map))) {
+  
+  this_set <- sample_map[i, ]
+  this_label_vector <- celltype_labels[[this_set$set_id]]
+  
+  results[[this_set$set_id]] <- run_one_set(
+    set_row = this_set,
+    cluster_label_vector = this_label_vector
+  )
+}
+
+# ---- Combine results across samples 81-84 ----
+
+combined_diversity <- bind_rows(lapply(results, `[[`, "diversity_summary"))
+combined_bins <- bind_rows(lapply(results, `[[`, "bin_summary"))
+combined_overlap <- bind_rows(lapply(results, `[[`, "overlap_summary"))
+combined_tcr_by_cluster <- bind_rows(lapply(results, `[[`, "tcr_by_cluster"))
+combined_tcr_by_celltype <- bind_rows(lapply(results, `[[`, "tcr_by_celltype"))
+combined_top_clones_by_celltype <- bind_rows(lapply(results, `[[`, "top_clones_by_celltype"))
+combined_top_markers <- bind_rows(lapply(results, `[[`, "top_markers_compact"), .id = "set_id")
+
+write_csv(combined_diversity, file.path(comparison_dir, "combined_01_tcr_diversity_summary.csv"))
+write_csv(combined_bins, file.path(comparison_dir, "combined_02_clonotype_frequency_bins.csv"))
+write_csv(combined_overlap, file.path(comparison_dir, "combined_03_barcode_overlap_summary.csv"))
+write_csv(combined_tcr_by_cluster, file.path(comparison_dir, "combined_04_TCR_frequency_bin_by_cluster.csv"))
+write_csv(combined_tcr_by_celltype, file.path(comparison_dir, "combined_05_TCR_frequency_bin_by_celltype.csv"))
+write_csv(combined_top_clones_by_celltype, file.path(comparison_dir, "combined_06_Top_TCR_clonotypes_by_celltype.csv"))
+write_csv(combined_top_markers, file.path(comparison_dir, "combined_07_top_markers_compact.csv"))
+
+# ---- Generate cross-sample comparison plots ----
+
+# Compare the contribution of the most abundant clonotypes
+diversity_long <- combined_diversity %>%
+  select(set_id, tcr_sample, top_1_percent, top_10_percent, top_20_percent, top_50_percent) %>%
+  pivot_longer(
+    cols = starts_with("top_"),
+    names_to = "metric",
+    values_to = "percent"
+  ) %>%
+  mutate(
+    metric = recode(
+      metric,
+      top_1_percent = "Top 1 clone",
+      top_10_percent = "Top 10 clones",
+      top_20_percent = "Top 20 clones",
+      top_50_percent = "Top 50 clones"
+    )
+  )
+
+p_compare_top <- diversity_long %>%
+  ggplot(aes(x = tcr_sample, y = percent, fill = metric)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "TCR Clonal Burden Across Samples",
+    x = "TCR sample",
+    y = "Percent of TCR barcodes",
+    fill = "Metric"
+  ) +
+  theme_classic()
+
+save_plot(
+  p_compare_top,
+  file.path(comparison_dir, "comparison_01_top_clone_burden.png"),
+  width = 9,
+  height = 6
+)
+
+# Compare clonotype frequency-bin composition
+p_compare_bins <- combined_bins %>%
+  ggplot(aes(x = tcr_sample, y = percent_of_tcr_barcodes, fill = frequency_bin)) +
+  geom_col() +
+  labs(
+    title = "TCR Frequency Bin Composition Across Samples",
+    x = "TCR sample",
+    y = "Percent of TCR barcodes",
+    fill = "Frequency bin"
+  ) +
+  theme_classic()
+
+save_plot(
+  p_compare_bins,
+  file.path(comparison_dir, "comparison_02_frequency_bin_composition.png"),
+  width = 9,
+  height = 6
+)
+
+# Compare the proportion of GEX cells matched to TCR metadata
+p_compare_overlap <- combined_overlap %>%
+  ggplot(aes(x = tcr_sample, y = percent_seurat_cells_with_tcr)) +
+  geom_col() +
+  labs(
+    title = "Percent of GEX Cells with Matched TCR Metadata",
+    x = "TCR sample",
+    y = "Percent of Seurat cells with TCR"
+  ) +
+  theme_classic()
+
+save_plot(
+  p_compare_overlap,
+  file.path(comparison_dir, "comparison_03_percent_gex_cells_with_tcr.png"),
+  width = 8,
+  height = 5
+)
+
+# Compare dominant and expanded clonotypes across cell types
+expanded_by_celltype <- combined_tcr_by_celltype %>%
+  filter(tcr_frequency_bin %in% c("Dominant >=1%", "Expanded 0.2-1%")) %>%
+  group_by(set_id, tcr_sample, celltype_firstpass) %>%
+  summarise(
+    percent_dominant_or_expanded = sum(percent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  expanded_by_celltype,
+  file.path(comparison_dir, "combined_08_dominant_or_expanded_by_celltype.csv")
+)
+
+p_compare_expanded_celltype <- expanded_by_celltype %>%
+  ggplot(aes(x = celltype_firstpass, y = percent_dominant_or_expanded, fill = tcr_sample)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Dominant/Expanded TCR Categories by Cell Type",
+    x = "First-pass cell type",
+    y = "Percent of TCR-positive cells in category",
+    fill = "TCR sample"
+  ) +
+  theme_classic()
+
+save_plot(
+  p_compare_expanded_celltype,
+  file.path(comparison_dir, "comparison_04_expanded_TCR_by_celltype.png"),
+  width = 11,
+  height = 8
+)
+
+# ---- Review the generated comparison files ----
+
+list.files(comparison_dir)
+
+message("MASTER ANALYSIS COMPLETE.")
+message("Comparison outputs saved to: ", comparison_dir)
+
+
+# ---- Compare clonotypes across sets using CDR3 and V/J signatures ----
+# This follow-up section uses the per-set output files created above.
+
+set_dirs <- sample_map %>%
+  select(set_id, gex_sample, tcr_sample, analysis_dir) %>%
+  rename(outdir = analysis_dir)
+
+clonotype_signatures <- pmap_dfr(
+  set_dirs,
+  function(set_id, gex_sample, tcr_sample, outdir) {
+    
+    contigs <- read_csv(
+      file.path(outdir, "07_productive_tcr_contigs.csv"),
+      show_col_types = FALSE
+    ) %>%
+      clean_names()
+    
+    clonos <- read_csv(
+      file.path(outdir, "02_all_clonotypes_ranked_with_bins.csv"),
+      show_col_types = FALSE
+    ) %>%
+      clean_names()
+    
+    contigs %>%
+      filter(
+        chain %in% c("TRA", "TRB"),
+        !is.na(raw_clonotype_id),
+        !is.na(cdr3)
+      ) %>%
+      left_join(
+        clonos %>%
+          select(clonotype_id, clonotype_rank, frequency, percent, frequency_bin),
+        by = c("raw_clonotype_id" = "clonotype_id")
+      ) %>%
+      group_by(raw_clonotype_id, clonotype_rank, frequency, percent, frequency_bin) %>%
+      summarise(
+        tra_cdr3s = paste(sort(unique(cdr3[chain == "TRA"])), collapse = "; "),
+        trb_cdr3s = paste(sort(unique(cdr3[chain == "TRB"])), collapse = "; "),
+        
+        cdr3_signature = paste(
+          sort(unique(paste(chain, cdr3, sep = ":"))),
+          collapse = "|"
+        ),
+        
+        vj_cdr3_signature = paste(
+          sort(unique(paste(chain, v_gene, j_gene, cdr3, sep = ":"))),
+          collapse = "|"
+        ),
+        
+        n_cells_with_clonotype = n_distinct(barcode),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        set_id = set_id,
+        gex_sample = gex_sample,
+        tcr_sample = tcr_sample,
+        sample_clonotype_id = paste(tcr_sample, raw_clonotype_id, sep = ": "),
+        .before = 1
+      )
+  }
+)
+
+write_csv(
+  clonotype_signatures,
+  file.path(comparison_dir, "combined_09_clonotype_CDR3_signatures.csv")
+)
+
+shared_vj_cdr3_across_sets <- clonotype_signatures %>%
+  group_by(vj_cdr3_signature) %>%
+  summarise(
+    n_sets = n_distinct(set_id),
+    sets_detected = paste(unique(set_id), collapse = "; "),
+    samples_detected = paste(unique(tcr_sample), collapse = "; "),
+    clonotype_ids = paste(unique(sample_clonotype_id), collapse = "; "),
+    ranks = paste(paste(tcr_sample, clonotype_rank, sep = " rank "), collapse = "; "),
+    percents = paste(paste(tcr_sample, round(percent, 3), sep = " "), collapse = "%; "),
+    frequency_bins = paste(unique(frequency_bin), collapse = "; "),
+    tra_cdr3s = paste(unique(tra_cdr3s), collapse = " || "),
+    trb_cdr3s = paste(unique(trb_cdr3s), collapse = " || "),
+    .groups = "drop"
+  ) %>%
+  filter(n_sets > 1) %>%
+  arrange(desc(n_sets))
+
+write_csv(
+  shared_vj_cdr3_across_sets,
+  file.path(comparison_dir, "combined_11_shared_VJ_CDR3_clonotypes_across_sets.csv")
+)
+
+shared_vj_cdr3_across_sets
